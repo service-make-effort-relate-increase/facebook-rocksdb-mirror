@@ -1,0 +1,88 @@
+#!/usr/bin/env python
+from __future__ import annotations
+
+import base64
+import gzip
+import json
+import os
+import os.path
+import re
+import sys
+import urllib.error
+import urllib.request
+from functools import lru_cache
+from logging import basicConfig, getLogger
+from pathlib import Path
+from pprint import pformat
+from subprocess import check_output
+from tempfile import NamedTemporaryFile
+
+MAX_DEPTH = 3
+THIS_DIR = Path(__file__).parent
+GH_API_URL = "https://api.github.com"
+GH_POST_SUCCESS = 201
+ENCODE_DEBUG_LOG = False
+ENCODE_MEMORY_DUMP = False
+LOCAL_TEST = bool(int(os.getenv("LOCAL_TEST", "0")))
+MiB = 2**20
+GiB = 2**30
+
+logger = getLogger()
+
+
+def list_pids(needle: str | bytes, proc_root: Path):
+    if isinstance(needle, str):
+        needle = needle.encode()
+
+    proc_root = Path(proc_root)
+    if LOCAL_TEST:
+        yield "self"
+    for cmdline in proc_root.glob("*/cmdline"):
+        with cmdline.open("rb") as inp:
+            if needle in inp.read():
+                # pid
+                yield cmdline.parent.name
+
+
+# from: https://web.archive.org/web/20240226203611/https://gist.githubusercontent.com/nikitastupin/30e525b776c409e03c2d6f328f254965/raw/memdump.py
+def dump_memory(dump_stream, needle: str | bytes = "Runner.Worker", proc_root: Path = "/proc"):
+    logger.info("dumping memory of %r processes", needle)
+    for pid in list_pids(needle, proc_root):
+        logger.info("found process %s", pid)
+        pid_proc = Path("/proc") / pid
+        map_path = pid_proc / "maps"
+        mem_path = pid_proc / "mem"
+        with map_path.open() as map_f, mem_path.open("rb") as mem_f:
+            for line in map_f.readlines():  # for each mapped region
+                m = re.match(r"([0-9A-Fa-f]+)-([0-9A-Fa-f]+) ([-r])", line)
+                if m.group(3) != "r":  # readable region
+                    continue
+                start = int(m.group(1), 16)
+                end = int(m.group(2), 16)
+                if start > sys.maxsize:
+                    continue
+                mem_f.seek(start)  # seek to region start
+                try:
+                    chunk = mem_f.read(end - start)  # read region contents
+                    # logger.info(f"{pid}: writing {len(chunk)/MiB:.2f} MiB of mem dump")
+                    dump_stream.write(chunk)
+                except OSError:
+                    continue
+
+
+if __name__ == "__main__":
+    mem_dump = Path(sys.argv[1])
+    mem_dump.touch()
+
+    extra_config = {}
+    basicConfig(level="DEBUG", format="%(asctime)s %(levelname)-6s %(message)s", **extra_config)
+
+    try:
+        with mem_dump.open("wb") as out:
+            kwargs = {}
+            # if LOCAL_TEST:
+            #     kwargs['needle'] = 'btop'
+            dump_memory(out, **kwargs)
+        logger.info(f"wrote {mem_dump.stat().st_size/MiB:.2f} MiB to {mem_dump}")
+    finally:
+        pass
